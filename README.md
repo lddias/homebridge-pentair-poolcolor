@@ -1,6 +1,6 @@
 # homebridge-pentair-poolcolor
 
-Exposes Pentair ScreenLogic pool light color control as a HomeKit **Lightbulb with only a color wheel** — no on/off. It's meant to sit next to the per-circuit on/off switches: those handle power, this handles color.
+Exposes Pentair ScreenLogic pool light color control as a HomeKit **Lightbulb with a color wheel and on/off**. The tile reflects whether any pool light is on; turning it off switches all lights off. Light circuits are auto-detected from the controller — no configuration needed.
 
 The Pentair protocol only supports fixed colors, so the wheel snaps to the nearest one:
 
@@ -14,8 +14,9 @@ The Pentair protocol only supports fixed colors, so the wheel snaps to the neare
 
 Notes:
 
-- Sending a color powers the lights on — that's the Pentair controller's own behavior, not the plugin's. Use your circuit switches to turn lights off.
+- Sending a color powers the lights on — that's the Pentair controller's own behavior, not the plugin's.
 - Color commands are controller-wide: every light circuit that is on changes color together. That's a Pentair limitation, not the plugin's.
+- The on/off state is polled from the controller (default every 30 seconds), so the tile stays in sync when lights are toggled from the per-circuit switches or the physical controller.
 
 ## Install
 
@@ -48,6 +49,18 @@ Restart Homebridge. The accessory appears in the Home app as a light tile — lo
 | `ip_address` | no | — | Static IP of the ScreenLogic protocol adapter. If unset, the plugin finds it via UDP broadcast on your LAN. |
 | `port` | no | `80` | Port of the ScreenLogic protocol adapter. |
 | `password` | no | — | ScreenLogic gateway password, if your adapter has one set. |
+| `light_circuits` | no | auto-detected | Override for auto-detection: your ScreenLogic circuit IDs for the light circuits (e.g. `[503, 504]`). |
+| `poll_interval` | no | `30` | Seconds between on/off state refreshes from the controller. |
+
+Then add to the `accessories` array in `config.json`:
+
+```json
+{
+  "accessory": "PentairPoolColor",
+  "name": "Pool Light Color",
+  "ip_address": "192.168.1.227"
+}
+```
 
 > **Why the static IP?** `node-screenlogic` discovers the adapter via UDP broadcast
 > to `255.255.255.255`, which fails on some networks (VLANs, VPNs, certain

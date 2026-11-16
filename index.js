@@ -4,8 +4,9 @@
  * homebridge-pentair-poolcolor
  *
  * Exposes Pentair ScreenLogic pool light color control as a HomeKit Lightbulb
- * with ONLY Hue/Saturation — a pure color picker with no on/off. The user
- * already has per-circuit on/off switches; this accessory is just the wheel.
+ * with Hue/Saturation AND On/Off. The color wheel is still the main control;
+ * On reflects whether any of the configured light circuits is on, and turning
+ * it off switches all of them off.
  *
  * The Pentair protocol only supports a handful of fixed colors, so the wheel
  * position is snapped to the nearest supported color:
@@ -42,6 +43,7 @@ const HUE_CENTERS = [
 const SATURATION_WHITE_THRESHOLD = 15; // % — below this, pick white
 const COLOR_DEBOUNCE_MS = 700; // coalesce color-wheel drags into one command
 const SEND_TIMEOUT_MS = 15000; // upper bound on discovery+connect+login+command; node-screenlogic has no timeouts of its own
+const DEFAULT_POLL_INTERVAL_S = 30; // how often to refresh on/off state from the controller
 
 let Service, Characteristic;
 
@@ -73,6 +75,50 @@ class PoolController {
     this.ip_address = config.ip_address;
     this.port = config.port || 80;
     this.password = config.password;
+    // node-screenlogic's circuit API takes wire IDs minus 499
+    // (e.g. circuit 503 -> 4). Config keeps the familiar wire IDs.
+    // If light_circuits is set, those are used as-is. Otherwise the plugin
+    // auto-detects light circuits from the controller at startup.
+    this.configuredCircuits = (config.light_circuits || []).map((id) => id - 499);
+    this.lightCircuits = [...this.configuredCircuits];
+    this.hasOnOff = false; // set true once light circuits are known
+    this._detectPromise = null;
+  }
+
+  // Discovers light circuits from the controller's circuit definitions.
+  // A circuit counts as a light if its interface is "lights" (4), its
+  // function is a light type, or its name mentions "light". Manual
+  // light_circuits config always wins over detection.
+  async detectLightCircuits() {
+    if (this.configuredCircuits.length > 0) {
+      this.lightCircuits = [...this.configuredCircuits];
+      this.hasOnOff = true;
+      return this.lightCircuits;
+    }
+    if (this._detectPromise) {
+      return this._detectPromise;
+    }
+    this._detectPromise = this.withConnection(
+      (connection) => connection.equipment.getCircuitDefinitionsAsync(),
+    ).then((defs) => {
+      const circuits = defs.circuitArray || defs;
+      const lights = circuits.filter((c) => {
+        // interface 4 = lights (per node-screenlogic docs)
+        if (c.interface === 4) return true;
+        // function codes for light types (Light, Dimmer, SAM/SAL, Photon Generator, Color Wheel)
+        if ([2, 3, 4, 5, 6, 7].includes(c.function)) return true;
+        // fallback: name mentions light
+        if (c.name && /light/i.test(c.name)) return true;
+        return false;
+      }).map((c) => c.circuitId);
+      this.lightCircuits = lights;
+      this.hasOnOff = lights.length > 0;
+      return lights;
+    }).catch((err) => {
+      this._detectPromise = null;
+      throw err;
+    });
+    return this._detectPromise;
   }
 
   // Runs fn with a fresh logged-in connection, always closing it afterwards.
@@ -154,6 +200,34 @@ class PoolController {
       connection.sendLightCommand(0, cmd);
     }));
   }
+
+  // Returns true if any of the light circuits is currently on.
+  async anyLightOn() {
+    await this.detectLightCircuits();
+    if (this.lightCircuits.length === 0) {
+      return false;
+    }
+    const states = await this.withConnection(
+      (connection) => connection.equipment.getEquipmentStateAsync(),
+    );
+    const onIds = new Set(
+      states.circuitArray.filter((c) => c.state === 1).map((c) => c.id),
+    );
+    return this.lightCircuits.some((id) => onIds.has(id));
+  }
+
+  // Switches all light circuits on or off.
+  async setLights(on) {
+    await this.detectLightCircuits();
+    if (this.lightCircuits.length === 0) {
+      throw new Error('no light circuits found on the controller');
+    }
+    return this.withConnection(async (connection) => {
+      for (const id of this.lightCircuits) {
+        await connection.circuits.setCircuitStateAsync(id, on ? 1 : 0);
+      }
+    });
+  }
 }
 
 class PoolColorAccessory {
@@ -161,22 +235,33 @@ class PoolColorAccessory {
     this.log = log;
     this.name = config.name || 'Pool Light Color';
     this.controller = new PoolController(config);
+    this.pollIntervalMs = (config.poll_interval || DEFAULT_POLL_INTERVAL_S) * 1000;
 
     this.currentHue = 0;
     this.currentSaturation = 100;
+    // Last hue/sat actually sent to the controller. Used to skip redundant
+    // sends — e.g. the Home app writing back values it just read, which
+    // would otherwise re-send the default red after every restart.
+    this.lastSentHue = 0;
+    this.lastSentSaturation = 100;
+    this.isOn = false;
     this.colorTimer = null;
     this.sending = false;    // a color command is currently in flight
     this.queuedColor = null; // latest color requested while a send is in flight
+    this.polling = false;    // a state poll is currently in flight
+    this.switching = false;  // an on/off command is currently in flight
 
     this.informationService = new Service.AccessoryInformation()
       .setCharacteristic(Characteristic.Manufacturer, 'Pentair')
       .setCharacteristic(Characteristic.Model, 'ScreenLogic Color Picker')
       .setCharacteristic(Characteristic.SerialNumber, 'poolcolor');
 
-    // Deliberately NO On characteristic: this tile is a pure color picker.
-    // On/off stays on the per-circuit switches.
     this.lightService = new Service.Lightbulb(this.name);
     this.lightService.setCharacteristic(Characteristic.Name, this.name);
+
+    this.lightService.getCharacteristic(Characteristic.On)
+      .on('get', (cb) => cb(null, this.isOn))
+      .on('set', (value, cb) => this.handleSetOn(value, cb));
 
     this.lightService.getCharacteristic(Characteristic.Hue)
       .on('get', (cb) => cb(null, this.currentHue))
@@ -186,11 +271,78 @@ class PoolColorAccessory {
       .on('get', (cb) => cb(null, this.currentSaturation))
       .on('set', (value, cb) => this.handleSetColor(null, value, cb));
 
-    this.log.info(`"${this.name}" ready — color picker only, no on/off`);
+    // Detect light circuits from the controller, then start polling.
+    // Manual light_circuits config skips detection.
+    this.controller.detectLightCircuits().then((circuits) => {
+      const wireIds = circuits.map((id) => id + 499);
+      if (circuits.length > 0) {
+        this.log.info(`"${this.name}" ready — light circuits detected: ${wireIds.join(', ')}`);
+      } else {
+        this.log.warn(`"${this.name}" ready — no light circuits found on the controller; on/off will not work`);
+      }
+      this.refreshOnState();
+    }).catch((err) => {
+      this.log.warn(`"${this.name}" ready — light circuit detection failed: ${err.message}; on/off will not work`);
+    });
+
+    // Periodic refresh so the tile tracks changes made from the per-circuit
+    // switches or the physical controller. Each poll awaits detection.
+    this.pollTimer = setInterval(() => this.refreshOnState(), this.pollIntervalMs);
+    // Don't keep the Homebridge process alive for the poll timer alone.
+    if (this.pollTimer.unref) {
+      this.pollTimer.unref();
+    }
   }
 
   getServices() {
     return [this.informationService, this.lightService];
+  }
+
+  async refreshOnState() {
+    if (this.polling) {
+      return;
+    }
+    this.polling = true;
+    try {
+      const on = await this.controller.anyLightOn();
+      if (on !== this.isOn) {
+        this.isOn = on;
+        this.lightService.updateCharacteristic(Characteristic.On, on);
+        this.log.info(`pool lights ${on ? 'on' : 'off'} (from controller)`);
+      }
+    } catch (err) {
+      this.log.warn('failed to refresh light state:', err.message);
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  handleSetOn(value, callback) {
+    const on = !!value;
+    callback(null);
+    if (on === this.isOn) {
+      return;
+    }
+    this.setLights(on);
+  }
+
+  async setLights(on) {
+    if (this.switching) {
+      return;
+    }
+    this.switching = true;
+    try {
+      await this.controller.setLights(on);
+      this.isOn = on;
+      this.lightService.updateCharacteristic(Characteristic.On, on);
+      this.log.info(`pool lights turned ${on ? 'on' : 'off'}`);
+    } catch (err) {
+      this.log.error('setLights failed:', err.message);
+      // Revert the tile so it reflects reality, not the failed request.
+      this.lightService.updateCharacteristic(Characteristic.On, this.isOn);
+    } finally {
+      this.switching = false;
+    }
   }
 
   handleSetColor(hue, saturation, callback) {
@@ -201,6 +353,14 @@ class PoolColorAccessory {
       this.currentSaturation = saturation;
     }
     callback(null);
+    // Skip if nothing actually changed since the last successful send.
+    // The Home app sometimes writes back the values it just read (e.g. on
+    // tile tap); without this, those write-backs would re-send the color —
+    // and after a restart, that means spuriously sending red (the default).
+    if (this.currentHue === this.lastSentHue &&
+        this.currentSaturation === this.lastSentSaturation) {
+      return;
+    }
     // Debounce: the Home app fires many sets while dragging the wheel.
     if (this.colorTimer) {
       clearTimeout(this.colorTimer);
@@ -235,6 +395,15 @@ class PoolColorAccessory {
           try {
             await this.controller.sendLightCommand(cmd);
             this.log.info(`pool color command sent: ${colorName}`);
+            // Record what actually went out, so write-backs of the same
+            // values don't trigger a redundant send.
+            this.lastSentHue = this.currentHue;
+            this.lastSentSaturation = this.currentSaturation;
+            // The controller powers the lights on when a color is sent.
+            if (!this.isOn) {
+              this.isOn = true;
+              this.lightService.updateCharacteristic(Characteristic.On, true);
+            }
           } catch (err) {
             this.log.error('sendLightCommand failed:', err.message);
           }
