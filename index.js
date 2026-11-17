@@ -75,20 +75,25 @@ class PoolController {
     this.ip_address = config.ip_address;
     this.port = config.port || 80;
     this.password = config.password;
-    // node-screenlogic's circuit API takes wire IDs minus 499
-    // (e.g. circuit 503 -> 4). Config keeps the familiar wire IDs.
+    // node-screenlogic circuit IDs are the protocol wire IDs (e.g. 503, 504)
+    // — used as-is everywhere, for config and for auto-detection.
     // If light_circuits is set, those are used as-is. Otherwise the plugin
     // auto-detects light circuits from the controller at startup.
-    this.configuredCircuits = (config.light_circuits || []).map((id) => id - 499);
+    this.configuredCircuits = [...(config.light_circuits || [])];
     this.lightCircuits = [...this.configuredCircuits];
     this.hasOnOff = false; // set true once light circuits are known
     this._detectPromise = null;
   }
 
   // Discovers light circuits from the controller's circuit definitions.
-  // A circuit counts as a light if its interface is "lights" (4), its
-  // function is a light type, or its name mentions "light". Manual
-  // light_circuits config always wins over detection.
+  // A circuit counts as a light if its interface is "lights" (3) or its
+  // function is the light type (16) — the values this controller reports
+  // for its 503/504 light circuits. (A name fallback is deliberately NOT
+  // used: circuit 506 "Waterfall Light" is a separate feature, not a pool
+  // light.) Manual light_circuits config always wins over detection.
+  // node-screenlogic is event-based: getControllerConfig() answers with a
+  // 'controllerConfig' event carrying bodyArray (circuitId, name, function,
+  // interface). There are no *Async methods and no .equipment object.
   async detectLightCircuits() {
     if (this.configuredCircuits.length > 0) {
       this.lightCircuits = [...this.configuredCircuits];
@@ -99,16 +104,13 @@ class PoolController {
       return this._detectPromise;
     }
     this._detectPromise = this.withConnection(
-      (connection) => connection.equipment.getCircuitDefinitionsAsync(),
-    ).then((defs) => {
-      const circuits = defs.circuitArray || defs;
+      (connection) => this._requestControllerConfig(connection),
+    ).then((cfg) => {
+      const circuits = cfg.bodyArray || [];
       const lights = circuits.filter((c) => {
-        // interface 4 = lights (per node-screenlogic docs)
-        if (c.interface === 4) return true;
-        // function codes for light types (Light, Dimmer, SAM/SAL, Photon Generator, Color Wheel)
-        if ([2, 3, 4, 5, 6, 7].includes(c.function)) return true;
-        // fallback: name mentions light
-        if (c.name && /light/i.test(c.name)) return true;
+        // interface 3 = lights, function 16 = light type
+        if (c.interface === 3) return true;
+        if (c.function === 16) return true;
         return false;
       }).map((c) => c.circuitId);
       this.lightCircuits = lights;
@@ -119,6 +121,42 @@ class PoolController {
       throw err;
     });
     return this._detectPromise;
+  }
+
+  // Asks the controller for its config and resolves with the decoded
+  // 'controllerConfig' message. Mirrors homebridge-pentair-screenlogic:
+  // getVersion first, then getControllerConfig on the 'version' event.
+  _requestControllerConfig(connection) {
+    return new Promise((resolve, reject) => {
+      connection
+        .once('version', () => connection.getControllerConfig())
+        .once('controllerConfig', resolve)
+        .once('error', reject);
+      connection.getVersion();
+    });
+  }
+
+  // Asks the controller for live status and resolves with the decoded
+  // 'poolStatus' message (circuitArray of {id, state}).
+  _requestPoolStatus(connection) {
+    return new Promise((resolve, reject) => {
+      connection
+        .once('poolStatus', resolve)
+        .once('error', reject);
+      connection.getPoolStatus();
+    });
+  }
+
+  // Sets one circuit's state and resolves when the controller confirms
+  // with 'circuitStateChanged'. circuitId is the protocol wire ID (503).
+  _setCircuitState(connection, circuitId, state) {
+    return new Promise((resolve, reject) => {
+      connection
+        .once('circuitStateChanged', resolve)
+        .once('badParameter', () => reject(new Error('bad parameter in setCircuitState')))
+        .once('error', reject);
+      connection.setCircuitState(0, circuitId, state);
+    });
   }
 
   // Runs fn with a fresh logged-in connection, always closing it afterwards.
@@ -207,11 +245,11 @@ class PoolController {
     if (this.lightCircuits.length === 0) {
       return false;
     }
-    const states = await this.withConnection(
-      (connection) => connection.equipment.getEquipmentStateAsync(),
+    const status = await this.withConnection(
+      (connection) => this._requestPoolStatus(connection),
     );
     const onIds = new Set(
-      states.circuitArray.filter((c) => c.state === 1).map((c) => c.id),
+      (status.circuitArray || []).filter((c) => c.state === 1).map((c) => c.id),
     );
     return this.lightCircuits.some((id) => onIds.has(id));
   }
@@ -224,7 +262,7 @@ class PoolController {
     }
     return this.withConnection(async (connection) => {
       for (const id of this.lightCircuits) {
-        await connection.circuits.setCircuitStateAsync(id, on ? 1 : 0);
+        await this._setCircuitState(connection, id, on ? 1 : 0);
       }
     });
   }
@@ -274,9 +312,8 @@ class PoolColorAccessory {
     // Detect light circuits from the controller, then start polling.
     // Manual light_circuits config skips detection.
     this.controller.detectLightCircuits().then((circuits) => {
-      const wireIds = circuits.map((id) => id + 499);
       if (circuits.length > 0) {
-        this.log.info(`"${this.name}" ready — light circuits detected: ${wireIds.join(', ')}`);
+        this.log.info(`"${this.name}" ready — light circuits detected: ${circuits.join(', ')}`);
       } else {
         this.log.warn(`"${this.name}" ready — no light circuits found on the controller; on/off will not work`);
       }
@@ -414,3 +451,6 @@ class PoolColorAccessory {
     })();
   }
 }
+
+// Exported for tests / live verification against a real controller.
+module.exports.PoolController = PoolController;
