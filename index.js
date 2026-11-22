@@ -32,7 +32,9 @@ const COLOR_CMDS = [
   ['white', ScreenLogic.LIGHT_CMD_COLOR_WHITE],
 ];
 
-// Hue wheel centers for the fixed colors (degrees). White is picked by low saturation.
+// Hue wheel centers for the fixed colors (degrees). White is picked by low saturation,
+// or by a warm (amber/yellow) hue: voice assistants send "warm white" as a saturated
+// amber hue (~35 deg), and Pentair has no amber — white is the closest match, red is not.
 const HUE_CENTERS = [
   ['red', 0],
   ['green', 120],
@@ -41,6 +43,8 @@ const HUE_CENTERS = [
 ];
 
 const SATURATION_WHITE_THRESHOLD = 15; // % — below this, pick white
+const WARM_HUE_WHITE_MIN = 15; // deg — warm/amber hues map to white, not red
+const WARM_HUE_WHITE_MAX = 60; // deg — up to the red/green midpoint
 const COLOR_DEBOUNCE_MS = 700; // coalesce color-wheel drags into one command
 const SEND_TIMEOUT_MS = 15000; // upper bound on discovery+connect+login+command; node-screenlogic has no timeouts of its own
 const DEFAULT_POLL_INTERVAL_S = 30; // how often to refresh on/off state from the controller
@@ -58,6 +62,11 @@ function hueToColorName(hue, saturation) {
     return 'white';
   }
   const h = ((hue % 360) + 360) % 360;
+  // Warm white from Siri arrives as a saturated amber hue (~35 deg). Pentair has
+  // no amber/yellow, so map the warm band to white instead of snapping to red.
+  if (h >= WARM_HUE_WHITE_MIN && h <= WARM_HUE_WHITE_MAX) {
+    return 'white';
+  }
   let best = HUE_CENTERS[0][0];
   let bestDist = 360;
   for (const [name, center] of HUE_CENTERS) {
@@ -454,3 +463,4 @@ class PoolColorAccessory {
 
 // Exported for tests / live verification against a real controller.
 module.exports.PoolController = PoolController;
+module.exports.hueToColorName = hueToColorName;

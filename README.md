@@ -7,10 +7,13 @@ The Pentair protocol only supports fixed colors, so the wheel snaps to the neare
 | Wheel position | Sent to controller |
 |---|---|
 | Saturation below ~15% | White |
+| Hue in the warm band (15°–60°, amber/yellow) | White |
 | Hue near red (0°) | Red |
 | Hue near green (120°) | Green |
 | Hue near blue (240°) | Blue |
 | Hue near purple (285°) | Purple |
+
+The warm band exists because voice assistants send "warm white" as a saturated amber hue (~35°) — Pentair has no amber, so white is the closest match. Without it, warm white snapped to red.
 
 Notes:
 

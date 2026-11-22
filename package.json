@@ -31,5 +31,5 @@
     "type": "git",
     "url": "git+https://github.com/lddias/homebridge-pentair-poolcolor.git"
   },
-  "version": "1.0.3"
+  "version": "1.0.4"
 }
